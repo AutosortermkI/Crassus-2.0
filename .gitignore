@@ -1,0 +1,32 @@
+# Azure Functions
+local.settings.json
+function_app/local.settings.json
+.azure/
+__pycache__/
+.python_packages/
+.venv/
+venv/
+env/
+
+# Secrets / env (never commit real values)
+.env
+config/.env
+config/local.env
+secrets/
+*.pem
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.pyc
+*.pyo
+
+# Build / deploy
+dist/
+*.egg-info/
+
+# Test / coverage
+.pytest_cache/
+htmlcov/
+.coverage

@@ -1,0 +1,5 @@
+# Azure Functions runtime
+azure-functions>=1.17.0
+
+# Alpaca Trading API (includes options support)
+alpaca-py>=0.14.0

@@ -10,18 +10,23 @@ function_app/
 ├── parser.py                # Webhook content parsing
 ├── strategy.py              # Strategy config + TP/SL/stop-limit computation
 ├── stock_orders.py          # Alpaca stock bracket order submission
-├── options_screener.py      # Options contract query + selection logic
+├── options_screener.py      # Options contract screening (Yahoo-first, Alpaca fallback)
 ├── options_orders.py        # Options order submission + exit management
 ├── risk.py                  # Risk sizing (fixed dollar; % equity planned)
+├── greeks.py                # Black-Scholes Greeks (Delta/Gamma/Theta/Vega) + IV solver
+├── yahoo_client.py          # Yahoo Finance crumb/cookie client for market data
 ├── utils.py                 # Correlation ID, structured logging, rounding
 ├── host.json                # Azure Functions host config
 ├── requirements.txt         # Python dependencies
 └── local.settings.json      # Env var template (gitignored)
 
 tests/
+├── conftest.py              # Adds function_app/ to sys.path
 ├── test_parser.py           # 26 tests: parsing, edge cases, example payloads
 ├── test_strategy.py         # 13 tests: bracket math, strategy lookup
-└── test_risk.py             # 9 tests:  options qty sizing, edge cases
+├── test_risk.py             # 9 tests:  options qty sizing, edge cases
+├── test_greeks.py           # 47 tests: BS pricing, Greeks, IV solver, edge cases
+└── test_yahoo_client.py     # 26 tests: Yahoo client, option chains, error handling
 ```
 
 ## Request flow
@@ -52,7 +57,9 @@ TradingView webhook
         ├─ mode=stock ──────► Stock bracket order (Alpaca BRACKET)
         │                         TP / SL / stop-limit computed from strategy %
         │
-        └─ mode=options ───► Screen contracts (DTE, moneyness, OI)
+        └─ mode=options ───► Fetch option chain (Yahoo Finance)
+                              ► Compute Greeks via Black-Scholes
+                              ► Screen by delta, volume, spread, OI
                               ► Risk-size qty from MAX_DOLLAR_RISK
                               ► Submit limit entry order (DAY)
                               ► Log TP/SL targets for external monitoring
@@ -110,13 +117,41 @@ Where `stop_distance = (stop_loss_pct / 100) × premium_price` and `× 100` is t
 
 ### Contract selection
 
-The screener queries Alpaca for contracts matching:
-- **DTE window:** 14–45 days (configurable)
-- **Strike range:** ±10 % of underlying price (proxy for delta range)
-- **Liquidity:** minimum open interest, volume, bid-ask spread
-- **Price:** within configured min/max premium range
+When Yahoo Finance is enabled (default), the screener uses Yahoo for richer market data and computes real Black-Scholes Greeks:
 
-Ranked by: closest to ATM, then highest open interest.
+1. **Fetch** option chains from Yahoo Finance (provides bid/ask/IV/volume/OI)
+2. **Compute** Greeks via `greeks.py` using Yahoo's IV data (or solve for IV from market prices)
+3. **Filter** candidates by:
+   - **DTE window:** 14–45 days (configurable)
+   - **Delta range:** 0.30–0.70 absolute delta (real Greeks, not moneyness proxy)
+   - **Volume:** minimum daily volume
+   - **Bid-ask spread:** max spread as % of mid price
+   - **Open interest:** minimum OI threshold
+   - **Price:** within configured min/max premium range
+4. **Score** using composite ranking: delta proximity (40%), OI (30%), spread tightness (20%), IV (10%)
+5. **Map** selected contract symbol to Alpaca for order submission
+
+**Fallback:** If Yahoo is unavailable or disabled (`YAHOO_ENABLED=false`), the screener falls back to Alpaca-only data with IV solved from close prices.
+
+### Greeks computation
+
+`greeks.py` implements the Black-Scholes model for European-style options:
+
+- **Pricing:** Call and put theoretical prices
+- **Delta:** Rate of change of price w.r.t. underlying
+- **Gamma:** Rate of change of delta w.r.t. underlying
+- **Theta:** Time decay per calendar day
+- **Vega:** Price sensitivity per 1% IV move
+- **IV solver:** Brent's method (`scipy.optimize.brentq`) to solve for implied volatility from observed market prices
+
+### Yahoo Finance integration
+
+`yahoo_client.py` provides authenticated access to Yahoo Finance's options API:
+
+- Cookie/crumb authentication with automatic refresh on 401
+- Exponential backoff on rate limiting (429) and transient errors (5xx)
+- Returns Crassus-compatible dataclasses (`YahooOptionContract`, `YahooOptionChain`)
+- Intelligent expiration selection: prefers 0DTE, falls back to nearest future
 
 ## Environment variables
 
@@ -161,13 +196,27 @@ Ranked by: closest to ATM, then highest open interest.
 |---|---|---|
 | `OPTIONS_DTE_MIN` | `14` | Min days to expiration |
 | `OPTIONS_DTE_MAX` | `45` | Max days to expiration |
-| `OPTIONS_DELTA_MIN` | `0.30` | Min absolute delta (moneyness proxy) |
-| `OPTIONS_DELTA_MAX` | `0.70` | Max absolute delta (moneyness proxy) |
+| `OPTIONS_DELTA_MIN` | `0.30` | Min absolute delta (real Greeks via `greeks.py`) |
+| `OPTIONS_DELTA_MAX` | `0.70` | Max absolute delta (real Greeks via `greeks.py`) |
 | `OPTIONS_MIN_OI` | `100` | Min open interest |
 | `OPTIONS_MIN_VOLUME` | `10` | Min daily volume |
 | `OPTIONS_MAX_SPREAD_PCT` | `5.0` | Max bid-ask spread as % of mid |
 | `OPTIONS_MIN_PRICE` | `0.50` | Min option premium ($) |
 | `OPTIONS_MAX_PRICE` | `50.0` | Max option premium ($) |
+
+### Greeks computation
+
+| Variable | Default | Description |
+|---|---|---|
+| `RISK_FREE_RATE` | `0.05` | Annualized risk-free rate for Black-Scholes (5%) |
+
+### Yahoo Finance data source
+
+| Variable | Default | Description |
+|---|---|---|
+| `YAHOO_ENABLED` | `true` | Toggle Yahoo Finance as market data source |
+| `YAHOO_RETRY_COUNT` | `5` | Max retries for Yahoo API requests |
+| `YAHOO_BACKOFF_BASE` | `2` | Exponential backoff base (seconds) |
 
 ### Risk sizing
 
@@ -175,6 +224,18 @@ Ranked by: closest to ATM, then highest open interest.
 |---|---|---|
 | `MAX_DOLLAR_RISK` | `50.0` | Max $ risk per options trade |
 | `RISK_PCT_OF_EQUITY` | *(not set)* | Future: % of account equity |
+
+## Dependencies
+
+| Package | Purpose |
+|---|---|
+| `azure-functions` | Azure Functions runtime |
+| `alpaca-py` | Alpaca Trading API (stocks + options execution) |
+| `scipy` | `norm.cdf`/`norm.pdf` (Greeks), `brentq` (IV solver) |
+| `numpy` | Numerical computation |
+| `requests` | Yahoo Finance HTTP client (direct API, not `yfinance`) |
+
+> **Note:** Do NOT add `yfinance`. The direct API approach via `requests` + `YahooCrumbClient` is more reliable and avoids the heavy `yfinance` dependency tree.
 
 ## Setup
 
@@ -201,7 +262,7 @@ Ranked by: closest to ATM, then highest open interest.
 4. **Run tests**
    ```bash
    pip install pytest
-   python -m pytest tests/ -v
+   python -m pytest tests/ -v    # 121 tests across 5 modules
    ```
 
 ## Example curl

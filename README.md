@@ -100,12 +100,23 @@ The webhook **must** include an `X-Webhook-Token` header matching the configured
 
 ## Options: design decisions
 
+### Data source vs execution venue
+
+Yahoo Finance and Alpaca serve different roles:
+
+| Concern | Source | Why |
+|---|---|---|
+| **Market data** (bid/ask/IV/volume/OI) | Yahoo Finance | Richer options data than Alpaca's trading API |
+| **Greeks computation** | `greeks.py` (local) | Black-Scholes from Yahoo's IV or solved from market prices |
+| **Contract screening** | `options_screener.py` | Uses Yahoo data + Greeks for delta-based selection |
+| **Order execution** | Alpaca | Execution venue; contract symbols map directly from Yahoo OCC format |
+
 ### Why no bracket orders for options?
 
-Alpaca does **not** support bracket orders (`BRACKET` / `OCO` / `OTO` order class) for options contracts. The API returns an error if you try. Therefore:
+This is an **Alpaca execution-side constraint** that Yahoo integration does not change. Alpaca does not support bracket orders (`BRACKET` / `OCO` / `OTO`) for options contracts -- the API returns an error if you try. Therefore:
 
 - **Entry:** Simple limit order with `TimeInForce.DAY`.
-- **Exits:** TP / SL target prices are logged with the correlation ID. A future **Timer Trigger** Azure Function will poll open positions and submit exit orders when targets are hit. See `options_orders.py::monitor_options_exits()` for the implementation outline.
+- **Exit monitoring:** TP / SL target prices are logged with the correlation ID. A future **Timer Trigger** Azure Function will poll open positions (using Yahoo market data snapshots for current prices) and submit exit orders when targets are hit. See `options_orders.py::monitor_options_exits()` for the implementation outline.
 
 ### Risk sizing
 

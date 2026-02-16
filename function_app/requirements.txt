@@ -3,3 +3,10 @@ azure-functions>=1.17.0
 
 # Alpaca Trading API (includes options support)
 alpaca-py>=0.14.0
+
+# Numerical computation (Greeks, IV solver)
+scipy>=1.11.0
+numpy>=1.24.0
+
+# Yahoo Finance HTTP client (direct API, not yfinance wrapper)
+requests>=2.31.0
